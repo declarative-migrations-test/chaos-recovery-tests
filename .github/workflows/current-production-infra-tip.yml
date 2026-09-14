@@ -1,0 +1,60 @@
+name: current production infra recovery tip
+on: {pull_request: {}, push: {branches: [main]}, workflow_dispatch: {}}
+permissions: {contents: read}
+jobs:
+  current-production-infra:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env: {GH_TOKEN: "${{ secrets.TEST_FLEET_GITHUB_TOKEN || github.token }}"}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {persist-credentials: false}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e
+        with: {terraform_version: 1.16.2, terraform_wrapper: false}
+      - name: Test 1 - clone exact current production infra tip
+        shell: bash
+        run: |
+          set -euo pipefail; p="${GITHUB_REPOSITORY_OWNER%-test}"
+          gh api --paginate "orgs/$p/repos?per_page=100&type=all" --jq '.[]|select(.archived==false)|[.name,.default_branch]|@tsv' >/tmp/repos
+          infra="$(awk -F '\t' '$1~/(^infra$|-infra$|\.infra$)/{print;exit}' /tmp/repos)"
+          test -n "$infra" || { echo "No production infra visible; configure TEST_FLEET_GITHUB_TOKEN or add canonical *-infra" >&2; exit 1; }
+          r="${infra%%$'\t'*}"; b="${infra#*$'\t'}"; s="$(gh api "repos/$p/$r/commits/$b" --jq .sha)"
+          gh repo clone "$p/$r" .deps/infra -- --depth=1 --branch "$b"
+          test "$(git -C .deps/infra rev-parse HEAD)" = "$s"
+          printf '%s\n' "$s" >/tmp/infra-sha
+          { echo "### Exact production infra tip"; echo "- repository: \`$p/$r\`"; echo "- branch: \`$b\`"; echo "- SHA: \`$s\`"; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Test 2 - declared module, environment, state, and remote-source boundaries are coherent
+        shell: bash
+        run: |
+          set -euo pipefail; root=.deps/infra; cfg="$root/.ores-infra.toml"
+          test -f "$cfg" || { echo "Canonical infra must declare .ores-infra.toml" >&2; exit 1; }
+          grep -Eq '^layout[[:space:]]*=[[:space:]]*"modules"' "$cfg"
+          modules_root="$(sed -nE 's/^modules_root[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$cfg")"
+          environments_root="$(sed -nE 's/^environments_root[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$cfg")"
+          test -n "$modules_root"; test -n "$environments_root"
+          case "$modules_root" in /*|*../*) echo "modules_root must stay inside repo" >&2; exit 1;; esac
+          case "$environments_root" in /*|*../*) echo "environments_root must stay inside repo" >&2; exit 1;; esac
+          test -d "$root/$modules_root"
+          for e in preview staging production; do test -d "$root/$environments_root/$e"; done
+          printf '%s\n' "$environments_root" >/tmp/environments-root
+          ! find "$root" -type f \( -name 'terraform.tfstate' -o -name 'terraform.tfstate.backup' -o -name '*.pem' -o -name '*.key' \) -print -quit | grep -q .
+          if grep -Eq '^remote_modules_require_commit_ref[[:space:]]*=[[:space:]]*true' "$cfg"; then
+            bad="$(grep -RhoE 'source[[:space:]]*=[[:space:]]*"git::[^"]+"' "$root" --include='*.tf' | grep -vE '\?ref=[0-9a-f]{40}"$' || true)"
+            test -z "$bad" || { echo "Unpinned remote Terraform module source(s):" >&2; printf '%s\n' "$bad" >&2; exit 1; }
+          fi
+      - name: Test 3 - Terraform current-tip roots format and environment roots validate
+        shell: bash
+        run: |
+          set -euo pipefail; root=.deps/infra; environments_root="$(cat /tmp/environments-root)"; n=0
+          for e in preview staging production; do
+            d="$root/$environments_root/$e"
+            if compgen -G "$d/*.tf" >/dev/null; then
+              terraform -chdir="$d" fmt -check -recursive
+              terraform -chdir="$d" init -backend=false -input=false
+              terraform -chdir="$d" validate -no-color
+              n=$((n+1))
+            fi
+          done
+          if [[ "$n" -eq 0 ]]; then
+            if find "$root" -name '*.tf' -print -quit | grep -q .; then terraform fmt -check -recursive "$root"; else echo "No Terraform roots yet; checkout/layout assertions still ran at $(cat /tmp/infra-sha)."; fi
+          fi
